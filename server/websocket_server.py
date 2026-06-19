@@ -12,12 +12,14 @@ import signal
 import time
 from typing import Set
 
+import cv2
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
 
 from camera import CameraCapture
 from ensemble import EnsembleResult, majority_vote
 from model_loader import ModelLoader
+from object_detector import detect_object_bbox, draw_hud
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +55,14 @@ class RecyclingLabServer:
         host: str = "localhost",
         port: int = 8765,
         inference_interval: float = 0.1,
+        show_preview: bool = True,
     ):
         self.model_loader = model_loader
         self.camera = camera
         self.host = host
         self.port = port
         self.inference_interval = inference_interval
+        self.show_preview = show_preview
 
         self._clients: Set[ServerConnection] = set()
         self._server: Server | None = None
@@ -114,70 +118,104 @@ class RecyclingLabServer:
 
     async def _inference_loop(self) -> None:
         """
-        Main loop: grab frame → infer → vote → broadcast.
+        Main loop: grab frame → detect object → crop → infer → vote → broadcast.
         Runs until ``self._running`` is set to ``False``.
         """
         logger.info("Inference loop started  (interval=%.0f ms)", self.inference_interval * 1000)
         loop = asyncio.get_event_loop()
 
-        while self._running:
-            cycle_start = time.perf_counter()
+        try:
+            while self._running:
+                cycle_start = time.perf_counter()
 
-            frame = await self.camera.get_frame_async()
-            if frame is None:
-                await asyncio.sleep(self.inference_interval)
-                continue
+                frame = await self.camera.get_frame_async()
+                if frame is None:
+                    await asyncio.sleep(self.inference_interval)
+                    continue
 
-            # Run inference in a thread-pool so we don't block the event loop
-            t0 = time.perf_counter()
-            raw_predictions = await loop.run_in_executor(
-                None, self.model_loader.predict_all, frame
-            )
-            inference_time = time.perf_counter() - t0
+                # 1. Detect object bounding box and crop
+                bbox = detect_object_bbox(frame)
+                x, y, w, h = bbox
+                cropped_frame = frame[y : y + h, x : x + w]
 
-            # Ensemble vote
-            predictions = [(cls, conf) for cls, conf, _ in raw_predictions]
-            result: EnsembleResult = majority_vote(predictions)
+                # Fallback to full frame if crop is invalid
+                inference_frame = cropped_frame if (cropped_frame is not None and cropped_frame.size > 0) else frame
 
-            # Build JSON packet
-            packet = result.to_json()
-            packet["inference_ms"] = round(inference_time * 1000, 1)
-            payload = json.dumps(packet)
+                # 2. Run inference on the cropped frame in a thread-pool so we don't block the event loop
+                t0 = time.perf_counter()
+                raw_predictions = await loop.run_in_executor(
+                    None, self.model_loader.predict_all, inference_frame
+                )
+                inference_time = time.perf_counter() - t0
 
-            # Broadcast
-            await self._broadcast(payload)
+                # 3. Ensemble vote
+                predictions = [(cls, conf) for cls, conf, _ in raw_predictions]
+                result: EnsembleResult = majority_vote(predictions)
 
-            # Stats
-            self._total_cycles += 1
-            self._total_inference_time += inference_time
-            if self._total_cycles % 50 == 0:
-                avg_ms = (self._total_inference_time / self._total_cycles) * 1000
-                logger.info(
-                    "Stats: %d cycles | avg inference %.0f ms | clients %d | "
-                    "last: %s (%.2f, %s)",
-                    self._total_cycles,
-                    avg_ms,
-                    len(self._clients),
+                # 4. Build JSON packet
+                packet = result.to_json()
+                packet["inference_ms"] = round(inference_time * 1000, 1)
+                payload = json.dumps(packet)
+
+                # 5. Broadcast
+                await self._broadcast(payload)
+
+                # 6. Render preview window if enabled
+                if self.show_preview:
+                    try:
+                        display_frame = draw_hud(
+                            frame=frame,
+                            bbox=bbox,
+                            ensemble_result=result,
+                            inference_ms=inference_time * 1000,
+                            cropped_img=inference_frame,
+                        )
+                        cv2.imshow("Recycling Lab Tycoon - AI Preview", display_frame)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            logger.info("'q' pressed on preview window — shutting down server …")
+                            self._running = False
+                    except Exception as e:
+                        logger.error("Error rendering preview window: %s", e)
+
+                # Stats
+                self._total_cycles += 1
+                self._total_inference_time += inference_time
+                if self._total_cycles % 50 == 0:
+                    avg_ms = (self._total_inference_time / self._total_cycles) * 1000
+                    logger.info(
+                        "Stats: %d cycles | avg inference %.0f ms | clients %d | "
+                        "last: %s (%.2f, %s)",
+                        self._total_cycles,
+                        avg_ms,
+                        len(self._clients),
+                        result.detected_item,
+                        result.confidence,
+                        result.method,
+                    )
+
+                # Log every prediction for debugging (at DEBUG level)
+                logger.debug(
+                    "→ %s  conf=%.3f  method=%s  votes=%s  infer=%dms",
                     result.detected_item,
                     result.confidence,
                     result.method,
+                    result.all_votes,
+                    inference_time * 1000,
                 )
 
-            # Log every prediction for debugging (at DEBUG level)
-            logger.debug(
-                "→ %s  conf=%.3f  method=%s  votes=%s  infer=%dms",
-                result.detected_item,
-                result.confidence,
-                result.method,
-                result.all_votes,
-                inference_time * 1000,
-            )
-
-            # Maintain target interval
-            elapsed = time.perf_counter() - cycle_start
-            sleep = self.inference_interval - elapsed
-            if sleep > 0:
-                await asyncio.sleep(sleep)
+                # Maintain target interval
+                elapsed = time.perf_counter() - cycle_start
+                sleep = self.inference_interval - elapsed
+                if sleep > 0:
+                    await asyncio.sleep(sleep)
+        finally:
+            if self.show_preview:
+                try:
+                    cv2.destroyAllWindows()
+                    logger.info("Preview window closed.")
+                except Exception:
+                    pass
 
     # ── Server lifecycle ──────────────────────────────────────────────
 

@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity.",
     )
+    p.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="Disable the real-time OpenCV camera preview GUI window.",
+    )
     return p.parse_args()
 
 
@@ -104,6 +109,7 @@ async def main() -> None:
         host=args.host,
         port=args.port,
         inference_interval=1.0 / args.fps,
+        show_preview=not args.no_preview,
     )
 
     # Graceful shutdown on Ctrl+C
