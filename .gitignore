@@ -120,6 +120,8 @@ env/
 venv/
 ENV/
 env.bak/
+client/
+frontend/
 venv.bak/
 
 # Spyder project settings
